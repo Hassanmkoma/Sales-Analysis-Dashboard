@@ -1,24 +1,557 @@
-ef calculate_numpy_kpis(df: pd.DataFrame) -> Dict[str, float]:
-"""Calculate core descriptive statistics using pure NumPy."""
-sales = df["Sales_Revenue"].to_numpy()
-profit = df["Profit"].to_numpy()
-quantities = df["Quantity"].to_numpy()
-total_revenue = float(np.sum(sales))
-total_profit = float(np.sum(profit))
-total_units_sold = int(np.sum(quantities))
-mean_order_val = float(np.mean(sales))
-median_order_val = float(np.median(sales))
-std_order_val = float(np.std(sales))
-p25, p75 = np.percentile(sales, [25, 75])
-overall_profit_margin = (total_profit / total_revenue) * 100
-return {
-"Total Revenue ($)": round(total_revenue, 2),
-"Total Profit ($)": round(total_profit, 2),
-"Total Units Sold": total_units_sold,
-"Overall Profit Margin (%)": round(overall_profit_margin, 2),
-"Average Order Value ($)": round(mean_order_val, 2),
-"Median Order Value ($)": round(median_order_val, 2),
-"Standard Deviation ($)": round(std_order_val, 2),
-"25th Percentile ($)": round(float(p25), 2),
-"75th Percentile ($)": round(float(p75), 2),
+"""
+Sales Analysis Dashboard
+========================
+Analyses sales revenue, quantities, product categories, geographical regions
+and customer segments using NumPy, Pandas and Matplotlib.
+
+Usage
+-----
+    python sales_dashboard.py                 # interactive menu
+    python sales_dashboard.py --save-all      # save every chart + report, no windows
+    python sales_dashboard.py --data my.csv   # use your own CSV file
+
+If no data file exists, a realistic sample dataset is generated automatically.
+"""
+
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import FuncFormatter
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+DATA_FILE = Path("data/sales_data.csv")
+OUTPUT_DIR = Path("output")
+SEED = 42
+CURRENCY = "$"
+
+REQUIRED_COLUMNS = [
+    "OrderID", "OrderDate", "Region", "Segment", "Category",
+    "Product", "Quantity", "UnitPrice", "Discount", "Revenue", "Profit",
+]
+
+# Category -> {product: base unit price}
+CATALOG = {
+    "Electronics": {"Laptop": 850, "Smartphone": 600, "Tablet": 400,
+                    "Smartwatch": 220, "Headphones": 120},
+    "Furniture": {"Sofa": 700, "Desk": 320, "Office Chair": 180, "Bookshelf": 140},
+    "Clothing": {"Jacket": 90, "Sneakers": 75, "Jeans": 50, "T-Shirt": 20},
+    "Office Supplies": {"Stapler": 15, "Pen Set": 12, "Printer Paper": 8, "Notebook": 6},
+    "Home & Kitchen": {"Vacuum Cleaner": 210, "Cookware Set": 130,
+                       "Coffee Maker": 95, "Blender": 65},
 }
+CATEGORY_WEIGHTS = {"Electronics": 0.24, "Furniture": 0.12, "Clothing": 0.24,
+                    "Office Supplies": 0.22, "Home & Kitchen": 0.18}
+CATEGORY_MARGIN = {"Electronics": 0.18, "Furniture": 0.22, "Clothing": 0.40,
+                   "Office Supplies": 0.35, "Home & Kitchen": 0.28}
+REGIONS = {"North": 0.28, "South": 0.22, "East": 0.20, "West": 0.30}
+SEGMENTS = {"Consumer": 0.52, "Corporate": 0.31, "Home Office": 0.17}
+
+COLORS = ["#2563EB", "#F59E0B", "#10B981", "#EF4444", "#8B5CF6",
+          "#14B8A6", "#EC4899", "#64748B"]
+plt.rcParams.update({
+    "figure.facecolor": "white",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.grid": True,
+    "grid.alpha": 0.25,
+    "axes.titleweight": "bold",
+    "axes.titlesize": 12,
+    "font.size": 9,
+})
+
+
+# --------------------------------------------------------------------------
+# 1. Data generation, loading and cleaning
+# --------------------------------------------------------------------------
+def generate_sample_data(n_orders: int = 5000, seed: int = SEED) -> pd.DataFrame:
+    """Create a realistic synthetic sales dataset covering two years."""
+    rng = np.random.default_rng(seed)
+
+    # Dates: seasonal (strong Q4) with year-over-year growth
+    days = pd.date_range("2024-01-01", "2025-12-31", freq="D")
+    month_factor = np.array([0.85, 0.80, 0.95, 1.00, 1.05, 1.00,
+                             0.95, 1.00, 1.05, 1.15, 1.40, 1.55])
+    weights = month_factor[days.month - 1] * np.where(days.year == 2025, 1.18, 1.0)
+    dates = rng.choice(days, size=n_orders, p=weights / weights.sum())
+
+    # Products
+    categories = rng.choice(list(CATEGORY_WEIGHTS), size=n_orders,
+                            p=list(CATEGORY_WEIGHTS.values()))
+    products = np.array([rng.choice(list(CATALOG[c])) for c in categories])
+    base_price = np.array([CATALOG[c][p] for c, p in zip(categories, products)])
+    unit_price = np.round(base_price * rng.normal(1.0, 0.05, n_orders), 2)
+
+    # Cheap items sell in larger quantities
+    max_qty = np.where(base_price < 30, 20, np.where(base_price < 150, 8, 4))
+    quantity = rng.integers(1, max_qty + 1)
+
+    discount = rng.choice([0.0, 0.05, 0.10, 0.15, 0.20], size=n_orders,
+                          p=[0.50, 0.20, 0.15, 0.10, 0.05])
+    revenue = np.round(unit_price * quantity * (1 - discount), 2)
+
+    margin = np.array([CATEGORY_MARGIN[c] for c in categories])
+    cost = unit_price * quantity * (1 - margin) * rng.normal(1.0, 0.04, n_orders)
+    profit = np.round(revenue - cost, 2)
+
+    df = pd.DataFrame({
+        "OrderDate": pd.to_datetime(dates),
+        "Region": rng.choice(list(REGIONS), size=n_orders, p=list(REGIONS.values())),
+        "Segment": rng.choice(list(SEGMENTS), size=n_orders, p=list(SEGMENTS.values())),
+        "Category": categories,
+        "Product": products,
+        "Quantity": quantity,
+        "UnitPrice": unit_price,
+        "Discount": discount,
+        "Revenue": revenue,
+        "Profit": profit,
+    }).sort_values("OrderDate").reset_index(drop=True)
+    df.insert(0, "OrderID", [f"ORD-{i:05d}" for i in range(1, n_orders + 1)])
+    return df
+
+
+def load_data(path: Path) -> pd.DataFrame:
+    """Load the sales CSV (generating sample data if missing) and clean it."""
+    if not path.exists():
+        print(f"[info] '{path}' not found - generating sample dataset...")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        generate_sample_data().to_csv(path, index=False)
+
+    df = pd.read_csv(path)
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        raise ValueError(f"Data file is missing required columns: {missing}")
+
+    # Cleaning
+    rows_before = len(df)
+    df = df.drop_duplicates(subset="OrderID")
+    df["OrderDate"] = pd.to_datetime(df["OrderDate"], errors="coerce")
+    for col in ["Quantity", "UnitPrice", "Discount", "Revenue", "Profit"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["OrderDate", "Quantity", "Revenue"])
+    df = df[(df["Quantity"] > 0) & (df["Revenue"] >= 0)]
+    for col in ["Region", "Segment", "Category", "Product"]:
+        df[col] = df[col].astype(str).str.strip()
+
+    # Derived columns
+    df["Year"] = df["OrderDate"].dt.year
+    df["Month"] = df["OrderDate"].dt.to_period("M")
+
+    print(f"[info] Loaded {len(df):,} rows "
+          f"({rows_before - len(df)} removed during cleaning) from '{path}'")
+    return df.reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------
+# 2. Statistical analysis (NumPy + Pandas)
+# --------------------------------------------------------------------------
+def compute_statistics(df: pd.DataFrame) -> dict:
+    """Compute headline KPIs and descriptive statistics."""
+    revenue = df["Revenue"].to_numpy()
+    quantity = df["Quantity"].to_numpy()
+    monthly = df.groupby("Month")["Revenue"].sum().sort_index()
+    m = monthly.to_numpy()
+
+    stats = {
+        "orders": len(df),
+        "total_revenue": np.sum(revenue),
+        "total_profit": np.sum(df["Profit"].to_numpy()),
+        "total_quantity": int(np.sum(quantity)),
+        "mean_order": np.mean(revenue),
+        "median_order": np.median(revenue),
+        "std_order": np.std(revenue, ddof=1) if len(revenue) > 1 else 0.0,
+        "min_order": np.min(revenue),
+        "max_order": np.max(revenue),
+        "p25": np.percentile(revenue, 25),
+        "p75": np.percentile(revenue, 75),
+        "p90": np.percentile(revenue, 90),
+        "avg_discount": np.mean(df["Discount"].to_numpy()),
+        "months": len(m),
+    }
+    stats["profit_margin"] = (stats["total_profit"] / stats["total_revenue"]
+                              if stats["total_revenue"] else 0.0)
+    stats["qty_rev_corr"] = (np.corrcoef(quantity, revenue)[0, 1]
+                             if len(revenue) > 2 else np.nan)
+
+    # Month-over-month growth and linear trend of monthly revenue
+    if len(m) > 1:
+        growth = np.diff(m) / m[:-1]
+        stats["avg_mom_growth"] = np.mean(growth)
+        stats["trend_slope"] = np.polyfit(np.arange(len(m)), m, 1)[0]
+        stats["best_month"] = str(monthly.idxmax())
+        stats["worst_month"] = str(monthly.idxmin())
+    else:
+        stats["avg_mom_growth"] = np.nan
+        stats["trend_slope"] = np.nan
+        stats["best_month"] = stats["worst_month"] = str(monthly.index[0])
+
+    stats["top_category"] = df.groupby("Category")["Revenue"].sum().idxmax()
+    stats["top_region"] = df.groupby("Region")["Revenue"].sum().idxmax()
+    stats["top_segment"] = df.groupby("Segment")["Revenue"].sum().idxmax()
+    stats["top_product"] = df.groupby("Product")["Revenue"].sum().idxmax()
+    return stats
+
+
+def breakdown(df: pd.DataFrame, column: str) -> pd.DataFrame:
+    """Revenue / quantity / profit summary for one dimension."""
+    table = df.groupby(column).agg(
+        Orders=("OrderID", "count"),
+        Quantity=("Quantity", "sum"),
+        Revenue=("Revenue", "sum"),
+        Profit=("Profit", "sum"),
+        AvgOrder=("Revenue", "mean"),
+    )
+    table["Share%"] = table["Revenue"] / table["Revenue"].sum() * 100
+    table["Margin%"] = table["Profit"] / table["Revenue"] * 100
+    return table.sort_values("Revenue", ascending=False).round(2)
+
+
+def build_report(df: pd.DataFrame, label: str = "All data") -> str:
+    """Return a plain-text summary report."""
+    s = compute_statistics(df)
+    money = lambda v: f"{CURRENCY}{v:,.2f}"  # noqa: E731
+    lines = [
+        "=" * 64,
+        "SALES ANALYSIS REPORT".center(64),
+        f"Filter: {label}".center(64),
+        "=" * 64,
+        f"Period              : {df['OrderDate'].min():%d %b %Y} - "
+        f"{df['OrderDate'].max():%d %b %Y}",
+        f"Total orders        : {s['orders']:,}",
+        f"Units sold          : {s['total_quantity']:,}",
+        f"Total revenue       : {money(s['total_revenue'])}",
+        f"Total profit        : {money(s['total_profit'])}",
+        f"Profit margin       : {s['profit_margin']:.1%}",
+        f"Average discount    : {s['avg_discount']:.1%}",
+        "",
+        "ORDER VALUE STATISTICS",
+        "-" * 64,
+        f"Mean                : {money(s['mean_order'])}",
+        f"Median              : {money(s['median_order'])}",
+        f"Std deviation       : {money(s['std_order'])}",
+        f"Min / Max           : {money(s['min_order'])} / {money(s['max_order'])}",
+        f"25th / 75th / 90th  : {money(s['p25'])} / {money(s['p75'])} / {money(s['p90'])}",
+        f"Qty-Revenue corr.   : {s['qty_rev_corr']:.3f}",
+        "",
+        "TREND",
+        "-" * 64,
+        f"Avg monthly growth  : {s['avg_mom_growth']:.2%}",
+        f"Linear trend        : {money(s['trend_slope'])} per month",
+        f"Best / worst month  : {s['best_month']} / {s['worst_month']}",
+        "",
+        "TOP PERFORMERS",
+        "-" * 64,
+        f"Category            : {s['top_category']}",
+        f"Region              : {s['top_region']}",
+        f"Customer segment    : {s['top_segment']}",
+        f"Product             : {s['top_product']}",
+    ]
+    for dim in ["Category", "Region", "Segment"]:
+        lines += ["", f"BREAKDOWN BY {dim.upper()}", "-" * 64,
+                  breakdown(df, dim).to_string()]
+    lines.append("=" * 64)
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# 3. Visualisations (Matplotlib)
+# --------------------------------------------------------------------------
+def _money(value: float, _pos=None) -> str:
+    if abs(value) >= 1e6:
+        return f"{CURRENCY}{value / 1e6:.1f}M"
+    if abs(value) >= 1e3:
+        thousands = value / 1e3
+        text = f"{thousands:.1f}" if abs(thousands) < 10 else f"{thousands:.0f}"
+        return f"{CURRENCY}{text.removesuffix('.0')}K"
+    return f"{CURRENCY}{value:.0f}"
+
+
+MONEY_FMT = FuncFormatter(_money)
+
+
+def plot_monthly_trend(df: pd.DataFrame, ax: plt.Axes) -> None:
+    monthly = df.groupby("Month")["Revenue"].sum().sort_index()
+    x = np.arange(len(monthly))
+    y = monthly.to_numpy()
+    ax.plot(x, y, marker="o", color=COLORS[0], linewidth=2, label="Monthly revenue")
+    ax.fill_between(x, y, alpha=0.12, color=COLORS[0])
+    if len(x) > 2:
+        slope, intercept = np.polyfit(x, y, 1)
+        ax.plot(x, slope * x + intercept, "--", color=COLORS[3],
+                linewidth=1.5, label="Linear trend")
+        rolling = monthly.rolling(3).mean().to_numpy()
+        ax.plot(x, rolling, color=COLORS[1], linewidth=1.5, label="3-month average")
+    step = max(1, len(x) // 12)
+    ax.set_xticks(x[::step])
+    ax.set_xticklabels([p.strftime("%b %y") for p in monthly.index[::step]], rotation=45)
+    ax.yaxis.set_major_formatter(MONEY_FMT)
+    ax.set_title("Monthly Revenue Trend")
+    ax.legend(frameon=False, loc="upper left")
+
+
+def plot_category(df: pd.DataFrame, ax: plt.Axes) -> None:
+    data = df.groupby("Category")[["Revenue", "Profit"]].sum().sort_values("Revenue",
+                                                                          ascending=False)
+    x = np.arange(len(data))
+    ax.bar(x - 0.2, data["Revenue"], 0.4, label="Revenue", color=COLORS[0])
+    ax.bar(x + 0.2, data["Profit"], 0.4, label="Profit", color=COLORS[2])
+    ax.set_xticks(x)
+    ax.set_xticklabels(data.index, rotation=20, ha="right")
+    ax.yaxis.set_major_formatter(MONEY_FMT)
+    ax.set_title("Revenue & Profit by Category")
+    ax.legend(frameon=False)
+
+
+def plot_region(df: pd.DataFrame, ax: plt.Axes) -> None:
+    data = df.groupby("Region")["Revenue"].sum().sort_values()
+    bars = ax.barh(data.index, data.to_numpy(), color=COLORS[4])
+    ax.bar_label(bars, labels=[_money(v) for v in data], padding=3)
+    ax.xaxis.set_major_formatter(MONEY_FMT)
+    ax.set_xlim(0, data.max() * 1.15)
+    ax.grid(axis="y", visible=False)
+    ax.set_title("Revenue by Region")
+
+
+def plot_segment(df: pd.DataFrame, ax: plt.Axes) -> None:
+    data = df.groupby("Segment")["Revenue"].sum().sort_values(ascending=False)
+    ax.pie(data, labels=data.index, autopct="%1.1f%%", startangle=90,
+           colors=COLORS[:len(data)], pctdistance=0.78,
+           wedgeprops={"width": 0.45, "edgecolor": "white"})
+    ax.set_title("Revenue Share by Customer Segment")
+
+
+def plot_top_products(df: pd.DataFrame, ax: plt.Axes, n: int = 10) -> None:
+    data = df.groupby("Product")["Revenue"].sum().nlargest(n).sort_values()
+    bars = ax.barh(data.index, data.to_numpy(), color=COLORS[5])
+    ax.bar_label(bars, labels=[_money(v) for v in data], padding=3)
+    ax.xaxis.set_major_formatter(MONEY_FMT)
+    ax.set_xlim(0, data.max() * 1.15)
+    ax.grid(axis="y", visible=False)
+    ax.set_title(f"Top {len(data)} Products by Revenue")
+
+
+def plot_heatmap(df: pd.DataFrame, ax: plt.Axes) -> None:
+    pivot = df.pivot_table(index="Region", columns="Category", values="Revenue",
+                           aggfunc="sum", fill_value=0)
+    values = pivot.to_numpy()
+    image = ax.imshow(values, cmap="Blues", aspect="auto")
+    ax.set_xticks(np.arange(pivot.shape[1]))
+    ax.set_xticklabels(pivot.columns, rotation=25, ha="right")
+    ax.set_yticks(np.arange(pivot.shape[0]))
+    ax.set_yticklabels(pivot.index)
+    threshold = values.max() * 0.6
+    for i in range(values.shape[0]):
+        for j in range(values.shape[1]):
+            ax.text(j, i, _money(values[i, j]), ha="center", va="center", fontsize=8,
+                    color="white" if values[i, j] > threshold else "black")
+    ax.grid(False)
+    ax.figure.colorbar(image, ax=ax, format=MONEY_FMT, fraction=0.046, pad=0.04)
+    ax.set_title("Revenue Heatmap: Region x Category")
+
+
+def plot_distribution(df: pd.DataFrame, ax: plt.Axes) -> None:
+    revenue = df["Revenue"].to_numpy()
+    upper = np.percentile(revenue, 99)  # trim extreme outliers for readability
+    ax.hist(revenue[revenue <= upper], bins=40, color=COLORS[0], alpha=0.8,
+            edgecolor="white")
+    ax.axvline(np.mean(revenue), color=COLORS[3], linestyle="--",
+               label=f"Mean {_money(np.mean(revenue))}")
+    ax.axvline(np.median(revenue), color=COLORS[1], linestyle="--",
+               label=f"Median {_money(np.median(revenue))}")
+    ax.xaxis.set_major_formatter(MONEY_FMT)
+    ax.set_ylabel("Orders")
+    ax.set_title("Order Value Distribution")
+    ax.legend(frameon=False)
+
+
+def plot_quantity_by_category(df: pd.DataFrame, ax: plt.Axes) -> None:
+    pivot = df.pivot_table(index="Category", columns="Segment", values="Quantity",
+                           aggfunc="sum", fill_value=0)
+    pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).index]
+    bottom = np.zeros(len(pivot))
+    for i, segment in enumerate(pivot.columns):
+        ax.bar(pivot.index, pivot[segment], bottom=bottom, label=segment,
+               color=COLORS[i % len(COLORS)])
+        bottom += pivot[segment].to_numpy()
+    ax.tick_params(axis="x", rotation=20)
+    plt.setp(ax.get_xticklabels(), ha="right")
+    ax.set_ylabel("Units sold")
+    ax.set_title("Units Sold by Category & Segment")
+    ax.legend(frameon=False)
+
+
+CHARTS = {
+    "monthly_trend": plot_monthly_trend,
+    "category": plot_category,
+    "region": plot_region,
+    "segment": plot_segment,
+    "top_products": plot_top_products,
+    "heatmap": plot_heatmap,
+    "distribution": plot_distribution,
+    "quantity": plot_quantity_by_category,
+}
+
+
+def single_chart(df: pd.DataFrame, name: str) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    CHARTS[name](df, ax)
+    fig.tight_layout()
+    return fig
+
+
+def build_dashboard(df: pd.DataFrame, label: str = "All data") -> plt.Figure:
+    """Combine KPIs and all charts into a single dashboard figure."""
+    s = compute_statistics(df)
+    fig = plt.figure(figsize=(18, 13))
+    fig.suptitle("SALES ANALYSIS DASHBOARD", fontsize=20, fontweight="bold", y=0.985)
+    fig.text(0.5, 0.948, f"{label}   |   {df['OrderDate'].min():%b %Y} - "
+             f"{df['OrderDate'].max():%b %Y}", ha="center", fontsize=11, color="#475569")
+
+    # KPI cards
+    kpis = [
+        ("Total Revenue", _money(s["total_revenue"])),
+        ("Total Profit", _money(s["total_profit"])),
+        ("Profit Margin", f"{s['profit_margin']:.1%}"),
+        ("Orders", f"{s['orders']:,}"),
+        ("Units Sold", f"{s['total_quantity']:,}"),
+        ("Avg Order Value", f"{CURRENCY}{s['mean_order']:,.0f}"),
+    ]
+    card_w, gap, left = 0.138, 0.012, 0.08
+    for i, (title, value) in enumerate(kpis):
+        x = left + i * (card_w + gap)
+        card = fig.add_axes([x, 0.875, card_w, 0.06])
+        card.set_facecolor("#F1F5F9")
+        card.set_xticks([])
+        card.set_yticks([])
+        for spine in card.spines.values():
+            spine.set_visible(False)
+        card.text(0.5, 0.68, title, ha="center", va="center", fontsize=9,
+                  color="#475569", transform=card.transAxes)
+        card.text(0.5, 0.28, value, ha="center", va="center", fontsize=15,
+                  fontweight="bold", color=COLORS[i % len(COLORS)],
+                  transform=card.transAxes)
+
+    grid = GridSpec(3, 3, figure=fig, left=0.08, right=0.97, top=0.83, bottom=0.06,
+                    hspace=0.55, wspace=0.28)
+    plot_monthly_trend(df, fig.add_subplot(grid[0, :2]))
+    plot_segment(df, fig.add_subplot(grid[0, 2]))
+    plot_category(df, fig.add_subplot(grid[1, 0]))
+    plot_region(df, fig.add_subplot(grid[1, 1]))
+    plot_heatmap(df, fig.add_subplot(grid[1, 2]))
+    plot_top_products(df, fig.add_subplot(grid[2, 0]))
+    plot_quantity_by_category(df, fig.add_subplot(grid[2, 1]))
+    plot_distribution(df, fig.add_subplot(grid[2, 2]))
+    return fig
+
+
+# --------------------------------------------------------------------------
+# 4. Saving and interactive menu
+# --------------------------------------------------------------------------
+def save_all(df: pd.DataFrame, label: str = "All data") -> None:
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    fig = build_dashboard(df, label)
+    fig.savefig(OUTPUT_DIR / "dashboard.png", dpi=150)
+    plt.close(fig)
+    for name in CHARTS:
+        fig = single_chart(df, name)
+        fig.savefig(OUTPUT_DIR / f"{name}.png", dpi=150)
+        plt.close(fig)
+    (OUTPUT_DIR / "summary_report.txt").write_text(build_report(df, label),
+                                                   encoding="utf-8")
+    for dim in ["Category", "Region", "Segment", "Product"]:
+        breakdown(df, dim).to_csv(OUTPUT_DIR / f"breakdown_{dim.lower()}.csv")
+    print(f"[info] Dashboard, {len(CHARTS)} charts, report and breakdown tables "
+          f"saved to '{OUTPUT_DIR}/'")
+
+
+def choose(prompt: str, options: list) -> object | None:
+    """Ask the user to pick one option (or none to clear)."""
+    print(f"\n{prompt}")
+    print("  0. All (clear filter)")
+    for i, option in enumerate(options, 1):
+        print(f"  {i}. {option}")
+    answer = input("Choice: ").strip()
+    if answer.isdigit() and 1 <= int(answer) <= len(options):
+        return options[int(answer) - 1]
+    return None
+
+
+def interactive_menu(full_df: pd.DataFrame) -> None:
+    filters: dict[str, object] = {}
+    chart_names = list(CHARTS)
+
+    while True:
+        df = full_df
+        for column, value in filters.items():
+            df = df[df[column] == value]
+        label = ", ".join(f"{k}: {v}" for k, v in filters.items()) or "All data"
+
+        print("\n" + "=" * 46)
+        print("SALES ANALYSIS DASHBOARD".center(46))
+        print(f"Filter: {label}  ({len(df):,} orders)".center(46))
+        print("=" * 46)
+        print("  1. Summary report (statistics)")
+        print("  2. Full dashboard")
+        for i, name in enumerate(chart_names, 3):
+            print(f"  {i}. Chart: {name.replace('_', ' ').title()}")
+        print("  y. Filter by year      r. Filter by region")
+        print("  c. Filter by category  g. Filter by segment")
+        print("  s. Save everything to output/")
+        print("  q. Quit")
+        choice = input("Select an option: ").strip().lower()
+
+        if choice == "q":
+            break
+        if choice in {"y", "r", "c", "g"}:
+            column = {"y": "Year", "r": "Region", "c": "Category", "g": "Segment"}[choice]
+            value = choose(f"Filter by {column}:", sorted(full_df[column].unique()))
+            if value is None:
+                filters.pop(column, None)
+            else:
+                filters[column] = value
+            continue
+        if df.empty:
+            print("No data matches the current filters - change or clear a filter.")
+            continue
+        if choice == "1":
+            print(build_report(df, label))
+        elif choice == "2":
+            build_dashboard(df, label)
+            plt.show()
+        elif choice == "s":
+            save_all(df, label)
+        elif choice.isdigit() and 3 <= int(choice) < 3 + len(chart_names):
+            single_chart(df, chart_names[int(choice) - 3])
+            plt.show()
+        else:
+            print("Invalid option, try again.")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Sales Analysis Dashboard")
+    parser.add_argument("--data", type=Path, default=DATA_FILE,
+                        help="path to the sales CSV file")
+    parser.add_argument("--save-all", action="store_true",
+                        help="save dashboard, charts and report without opening windows")
+    args = parser.parse_args()
+
+    if args.save_all:
+        plt.switch_backend("Agg")
+
+    df = load_data(args.data)
+    if args.save_all:
+        print(build_report(df))
+        save_all(df)
+    else:
+        interactive_menu(df)
+
+
+if __name__ == "__main__":
+    main()
