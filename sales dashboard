@@ -1,0 +1,24 @@
+ef calculate_numpy_kpis(df: pd.DataFrame) -> Dict[str, float]:
+"""Calculate core descriptive statistics using pure NumPy."""
+sales = df["Sales_Revenue"].to_numpy()
+profit = df["Profit"].to_numpy()
+quantities = df["Quantity"].to_numpy()
+total_revenue = float(np.sum(sales))
+total_profit = float(np.sum(profit))
+total_units_sold = int(np.sum(quantities))
+mean_order_val = float(np.mean(sales))
+median_order_val = float(np.median(sales))
+std_order_val = float(np.std(sales))
+p25, p75 = np.percentile(sales, [25, 75])
+overall_profit_margin = (total_profit / total_revenue) * 100
+return {
+"Total Revenue ($)": round(total_revenue, 2),
+"Total Profit ($)": round(total_profit, 2),
+"Total Units Sold": total_units_sold,
+"Overall Profit Margin (%)": round(overall_profit_margin, 2),
+"Average Order Value ($)": round(mean_order_val, 2),
+"Median Order Value ($)": round(median_order_val, 2),
+"Standard Deviation ($)": round(std_order_val, 2),
+"25th Percentile ($)": round(float(p25), 2),
+"75th Percentile ($)": round(float(p75), 2),
+}
